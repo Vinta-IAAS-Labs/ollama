@@ -7,9 +7,9 @@ package gpu
 #cgo windows LDFLAGS: -lpthread
 
 #include "gpu_info.h"
-
 */
 import "C"
+
 import (
 	"fmt"
 	"log/slog"
@@ -70,7 +70,6 @@ var CudaTegra string = os.Getenv("JETSON_JETPACK")
 
 // Note: gpuMutex must already be held
 func initCudaHandles() *cudaHandles {
-
 	// TODO - if the ollama build is CPU only, don't do these checks as they're irrelevant and confusing
 
 	cHandles := &cudaHandles{}
@@ -211,14 +210,16 @@ func GetGPUInfo() GpuInfoList {
 		if err != nil {
 			slog.Warn("error looking up system memory", "error", err)
 		}
-		cpus = []CPUInfo{CPUInfo{
-			GpuInfo: GpuInfo{
-				memInfo: mem,
-				Library: "cpu",
-				Variant: cpuCapability,
-				ID:      "0",
+		cpus = []CPUInfo{
+			{
+				GpuInfo: GpuInfo{
+					memInfo: mem,
+					Library: "cpu",
+					Variant: cpuCapability,
+					ID:      "0",
+				},
 			},
-		}}
+		}
 
 		// Fallback to CPU mode if we're lacking required vector extensions on x86
 		if cpuCapability < GPURunnerCPUCapability && runtime.GOARCH == "amd64" {
@@ -230,8 +231,8 @@ func GetGPUInfo() GpuInfoList {
 
 		// On windows we bundle the nvidia library one level above the runner dir
 		depPath := ""
-		if runtime.GOOS == "windows" && envconfig.RunnersDir != "" {
-			depPath = filepath.Join(filepath.Dir(envconfig.RunnersDir), "cuda")
+		if runtime.GOOS == "windows" && envconfig.RunnersDir() != "" {
+			depPath = filepath.Join(filepath.Dir(envconfig.RunnersDir()), "cuda")
 		}
 
 		// Load ALL libraries
@@ -274,18 +275,40 @@ func GetGPUInfo() GpuInfoList {
 				gpuInfo.DriverMajor = driverMajor
 				gpuInfo.DriverMinor = driverMinor
 
+				// query the management library as well so we can record any skew between the two
+				// which represents overhead on the GPU we must set aside on subsequent updates
+				if cHandles.nvml != nil {
+					C.nvml_get_free(*cHandles.nvml, C.int(gpuInfo.index), &memInfo.free, &memInfo.total, &memInfo.used)
+					if memInfo.err != nil {
+						slog.Warn("error looking up nvidia GPU memory", "error", C.GoString(memInfo.err))
+						C.free(unsafe.Pointer(memInfo.err))
+					} else {
+						if memInfo.free != 0 && uint64(memInfo.free) > gpuInfo.FreeMemory {
+							gpuInfo.OSOverhead = uint64(memInfo.free) - gpuInfo.FreeMemory
+							slog.Info("detected OS VRAM overhead",
+								"id", gpuInfo.ID,
+								"library", gpuInfo.Library,
+								"compute", gpuInfo.Compute,
+								"driver", fmt.Sprintf("%d.%d", gpuInfo.DriverMajor, gpuInfo.DriverMinor),
+								"name", gpuInfo.Name,
+								"overhead", format.HumanBytes2(gpuInfo.OSOverhead),
+							)
+						}
+					}
+				}
+
 				// TODO potentially sort on our own algorithm instead of what the underlying GPU library does...
 				cudaGPUs = append(cudaGPUs, gpuInfo)
 			}
 		}
 
 		// Intel
-		if envconfig.IntelGpu {
+		if envconfig.IntelGPU() {
 			oHandles = initOneAPIHandles()
 			// On windows we bundle the oneapi library one level above the runner dir
 			depPath = ""
-			if runtime.GOOS == "windows" && envconfig.RunnersDir != "" {
-				depPath = filepath.Join(filepath.Dir(envconfig.RunnersDir), "oneapi")
+			if runtime.GOOS == "windows" && envconfig.RunnersDir() != "" {
+				depPath = filepath.Join(filepath.Dir(envconfig.RunnersDir()), "oneapi")
 			}
 
 			for d := range oHandles.oneapi.num_drivers {
@@ -338,14 +361,17 @@ func GetGPUInfo() GpuInfoList {
 					"before",
 					"total", format.HumanBytes2(cpus[0].TotalMemory),
 					"free", format.HumanBytes2(cpus[0].FreeMemory),
+					"free_swap", format.HumanBytes2(cpus[0].FreeSwap),
 				),
 				slog.Group(
 					"now",
 					"total", format.HumanBytes2(mem.TotalMemory),
 					"free", format.HumanBytes2(mem.FreeMemory),
+					"free_swap", format.HumanBytes2(mem.FreeSwap),
 				),
 			)
 			cpus[0].FreeMemory = mem.FreeMemory
+			cpus[0].FreeSwap = mem.FreeSwap
 		}
 
 		var memInfo C.mem_info_t
@@ -374,9 +400,14 @@ func GetGPUInfo() GpuInfoList {
 				slog.Warn("error looking up nvidia GPU memory")
 				continue
 			}
+			if cHandles.nvml != nil && gpu.OSOverhead > 0 {
+				// When using the management library update based on recorded overhead
+				memInfo.free -= C.uint64_t(gpu.OSOverhead)
+			}
 			slog.Debug("updating cuda memory data",
 				"gpu", gpu.ID,
 				"name", gpu.Name,
+				"overhead", format.HumanBytes2(gpu.OSOverhead),
 				slog.Group(
 					"before",
 					"total", format.HumanBytes2(gpu.TotalMemory),
@@ -581,7 +612,7 @@ func LoadOneapiMgmt(oneapiLibPaths []string) (int, *C.oneapi_handle_t, string) {
 }
 
 func getVerboseState() C.uint16_t {
-	if envconfig.Debug {
+	if envconfig.Debug() {
 		return C.uint16_t(1)
 	}
 	return C.uint16_t(0)
